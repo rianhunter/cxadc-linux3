@@ -96,6 +96,13 @@
 /* Must be a power of 2 */
 #define IRQ_PERIOD_IN_PAGES 0x200
 
+#define GPX_BWE 16
+#define GPX_OE 8
+#define GPX_IO 0
+
+/* should be between 0 and 7 inclusive */
+#define CAPTURE_SIGNAL_GPIO 1
+
 struct risc_page {
 	struct risc_page *next;
 	char buffer[PAGE_SIZE - sizeof(struct risc_page *)];
@@ -126,7 +133,6 @@ struct cxadc {
 	dma_addr_t pgvec_phy[MAX_DMA_PAGE+1];
 
 	atomic_t lgpcnt;
-	int initial_page;
 	/* device attributes */
 	int latency;
 	int audsel;
@@ -522,6 +528,13 @@ static void disable_card(struct cxadc *ctd)
 	cx_write(MO_VID_DMACNTRL, 0);
 	/* disable risc */
 	cx_write(MO_DEV_CNTRL2, 0);
+	/* set GPIO7 back to input mode */
+	if (ctd->audsel == -1) {
+		cx_write(MO_GP0_IO,
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_BWE) |
+			 ((0 << CAPTURE_SIGNAL_GPIO) << GPX_OE) |
+			 ((0 << CAPTURE_SIGNAL_GPIO) << GPX_IO));
+	}
 }
 
 /*
@@ -599,9 +612,25 @@ static int make_risc_instructions(struct cxadc *ctd)
 	unsigned int dma_addr;
 	unsigned int *pp = (unsigned int *)ctd->risc_inst_virt;
 
-	loop_addr = ctd->risc_inst_phy+4;
+	/* start fifo */
+	*pp++ = RISC_WRITECR | (3 << 16) | 1;
+	*pp++ = MO_VID_DMACNTRL;
+	*pp++ = (1 << 3);
+	*pp++ = (1 << 3);
+
+	if (ctd->audsel != -1) {
+		/* set GPIO to signal beginning of capture now that fifo is started */
+		*pp++ = RISC_WRITECR | (3 << 16) | 1;
+		*pp++ = MO_GP0_IO;
+		*pp++ = ((1 << CAPTURE_SIGNAL_GPIO) << GPX_BWE) |
+			((1 << CAPTURE_SIGNAL_GPIO) << GPX_OE) |
+			((1 << CAPTURE_SIGNAL_GPIO) << GPX_IO);
+		*pp++ = 0xffffffff;
+	}
 
 	*pp++ = RISC_SYNC|(3<<16);
+
+	loop_addr = ctd->risc_inst_phy+(pp - ctd->risc_inst_virt) * 4;
 
 	irqt = 0;
 	for (i = 0; i < MAX_DMA_PAGE; i++) {
@@ -729,12 +758,13 @@ static int cxadc_char_open(struct inode *inode, struct file *file)
 
 	file->private_data = ctd;
 
-	atomic_set(&ctd->lgpcnt, -1);
+	atomic_set(&ctd->lgpcnt, 0);
 	cx_write(MO_PCI_INTMSK, 1); /* enable interrupt */
 
-	wait_event_interruptible(ctd->readQ, atomic_read(&ctd->lgpcnt) != -1);
-
-	ctd->initial_page = atomic_read(&ctd->lgpcnt);
+	/* run risc */
+	cx_write(MO_DEV_CNTRL2, 1<<5);
+	/* enable risc, fifo will be enabled in risc programm */
+	cx_write(MO_VID_DMACNTRL, (1<<7));
 
 	return 0;
 }
@@ -743,7 +773,20 @@ static int cxadc_char_release(struct inode *inode, struct file *file)
 {
 	struct cxadc *ctd = file->private_data;
 
+	/* disable fifo and risc */
+	cx_write(MO_VID_DMACNTRL, 0);
+	/* disable risc */
+	cx_write(MO_DEV_CNTRL2, 0);
+
 	cx_write(MO_PCI_INTMSK, 0);
+
+	if (ctd->audsel == -1) {
+		/* reset GPIO7 */
+		cx_write(MO_GP0_IO,
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_BWE) |
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_OE) |
+			 ((0 << CAPTURE_SIGNAL_GPIO) << GPX_IO));
+	}
 
 	mutex_lock(&ctd->lock);
 	ctd->in_use = false;
@@ -760,7 +803,6 @@ static ssize_t cxadc_char_read(struct file *file, char __user *tgt,
 	int gp_cnt;
 
 	pnum = (*offset % VBI_DMA_BUFF_SIZE) / PAGE_SIZE;
-	pnum += ctd->initial_page;
 	pnum %= MAX_DMA_PAGE;
 
 	gp_cnt = atomic_read(&ctd->lgpcnt);
@@ -787,7 +829,6 @@ static ssize_t cxadc_char_read(struct file *file, char __user *tgt,
 			rv += len;
 
 			pnum = (*offset % VBI_DMA_BUFF_SIZE) / PAGE_SIZE;
-			pnum += ctd->initial_page;
 			pnum %= MAX_DMA_PAGE;
 		}
 		/*
@@ -1079,11 +1120,6 @@ static int cxadc_probe(struct pci_dev *pci_dev,
 	/* power down audio and chroma DAC+ADC */
 	cx_write(MO_AFECFG_IO, 0x12);
 
-	/* run risc */
-	cx_write(MO_DEV_CNTRL2, 1<<5);
-	/* enable fifo and risc */
-	cx_write(MO_VID_DMACNTRL, ((1<<7)|(1<<3)));
-
 	rc = request_irq(ctd->irq, cxadc_irq, IRQF_SHARED, "cxadc", ctd);
 	if (rc < 0) {
 		cx_err("can't request irq (rc=%d)\n", rc);
@@ -1178,7 +1214,14 @@ static int cxadc_probe(struct pci_dev *pci_dev,
 		cx_write(MO_GP1_IO, 0x0b);
 		cx_write(MO_GP0_IO, ctd->audsel&3);
 		cx_info("audsel = %d\n", ctd->audsel&3);
-	}
+	} else {
+		cx_write(MO_PINMUX_IO, 0x0);
+		/* set up GPIO7 as capture indicator */
+		cx_write(MO_GP0_IO,
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_BWE) |
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_OE) |
+			 ((0 << CAPTURE_SIGNAL_GPIO) << GPX_IO));
+        }
 
 	/* i2c sda/scl set to high and use software control */
 	cx_write(MO_I2C, 3);
@@ -1354,10 +1397,6 @@ int cxadc_resume(struct pci_dev *pci_dev)
 	/* power down audio and chroma DAC+ADC */
 	cx_write(MO_AFECFG_IO, 0x12);
 
-	/* run risc */
-	cx_write(MO_DEV_CNTRL2, 1<<5);
-	/* enable fifo and risc */
-	cx_write(MO_VID_DMACNTRL, ((1<<7)|(1<<3)));
 	if (ctd->tenxfsc < 10) {
 	//old code for old parameter compatibility
 		switch (ctd->tenxfsc) {
@@ -1428,6 +1467,12 @@ int cxadc_resume(struct pci_dev *pci_dev)
 		cx_write(MO_GP3_IO, 1<<25); /* use as 24 bit GPIO/GPOE */
 		cx_write(MO_GP1_IO, 0x0b);
 		cx_write(MO_GP0_IO, ctd->audsel&3);
+	} else {
+		/* set up GPIO7 as capture indicator */
+		cx_write(MO_GP0_IO,
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_BWE) |
+			 ((1 << CAPTURE_SIGNAL_GPIO) << GPX_OE) |
+			 ((0 << CAPTURE_SIGNAL_GPIO) << GPX_IO));
 	}
 
 	/* i2c sda/scl set to high and use software control */
@@ -1435,6 +1480,16 @@ int cxadc_resume(struct pci_dev *pci_dev)
 
 	ret = request_irq(ctd->irq, cxadc_irq, IRQF_SHARED, "cxadc", ctd);
 	cx_write(MO_VID_INTMSK, INTERRUPT_MASK);
+
+	mutex_lock(&ctd->lock);
+	if (ctd->in_use) {
+		/* run risc */
+		cx_write(MO_DEV_CNTRL2, 1<<5);
+		/* enable risc, fifo will be enabled in risc programm */
+		cx_write(MO_VID_DMACNTRL, (1<<7));
+	}
+	mutex_unlock(&ctd->lock);
+
 	return 0;
 }
 
